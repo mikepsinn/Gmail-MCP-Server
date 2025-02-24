@@ -24,6 +24,9 @@ const CONFIG_DIR = path.join(os.homedir(), '.gmail-mcp');
 const OAUTH_PATH = process.env.GMAIL_OAUTH_PATH || path.join(CONFIG_DIR, 'gcp-oauth.keys.json');
 const CREDENTIALS_PATH = process.env.GMAIL_CREDENTIALS_PATH || path.join(CONFIG_DIR, 'credentials.json');
 
+// Default output directory for sent emails
+const DEFAULT_SENT_EMAILS_DIR = process.env.GMAIL_SENT_EMAILS_DIR || path.join(process.cwd(), 'sent-emails');
+
 // Signature configuration
 const SIGNATURE_TEMPLATE = process.env.GMAIL_SIGNATURE_TEMPLATE || '\n\nBest regards,\n{name}';  // Set to empty string to disable
 
@@ -112,6 +115,9 @@ async function authenticate() {
                 'https://www.googleapis.com/auth/gmail.modify',
                 'https://www.googleapis.com/auth/gmail.readonly',
                 'https://www.googleapis.com/auth/gmail.metadata',
+                'https://www.googleapis.com/auth/gmail.send',
+                'https://www.googleapis.com/auth/gmail.compose',
+                'https://www.googleapis.com/auth/gmail.labels',
                 'https://www.googleapis.com/auth/userinfo.profile'
             ],
         });
@@ -177,6 +183,96 @@ const DeleteEmailSchema = z.object({
     messageId: z.string().describe("ID of the email message to delete"),
 });
 
+const SaveSentEmailsSchema = z.object({
+    maxResults: z.number().optional().describe("Maximum number of sent emails to save (default: 50)"),
+    outputDir: z.string().optional().describe("Directory to save emails to (default: './sent-emails')"),
+});
+
+// Export the save sent emails function for testing
+export async function saveSentEmails(oauth2Client: OAuth2Client, maxResults: number = 50, outputDir?: string) {
+    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    const targetDir = outputDir || process.env.GMAIL_SENT_EMAILS_DIR || DEFAULT_SENT_EMAILS_DIR;
+    
+    // Create output directory if it doesn't exist
+    if (!fs.existsSync(targetDir)) {
+        fs.mkdirSync(targetDir, { recursive: true });
+    }
+
+    // Get list of sent messages
+    const listResponse = await gmail.users.messages.list({
+        userId: 'me',
+        maxResults: maxResults,
+        labelIds: ['SENT']
+    });
+
+    if (!listResponse.data.messages || listResponse.data.messages.length === 0) {
+        return {
+            savedEmails: [],
+            outputDir: targetDir,
+            message: "No sent messages found"
+        };
+    }
+
+    const savedEmails = [];
+
+    // Process each message
+    for (const message of listResponse.data.messages) {
+        const messageResponse = await gmail.users.messages.get({
+            userId: 'me',
+            id: message.id!,
+            format: 'metadata',
+            metadataHeaders: ['Subject', 'To', 'Date', 'Content-Type']
+        });
+
+        const headers = messageResponse.data.payload?.headers || [];
+        const subject = headers.find(h => h.name?.toLowerCase() === 'subject')?.value || 'No Subject';
+        const to = headers.find(h => h.name?.toLowerCase() === 'to')?.value || 'No Recipient';
+        const date = headers.find(h => h.name?.toLowerCase() === 'date')?.value || new Date().toISOString();
+
+        // Extract body content
+        let body = '';
+        const payload = messageResponse.data.payload!;
+        
+        if (payload.body?.data) {
+            body = Buffer.from(payload.body.data, 'base64').toString('utf8');
+        } else if (payload.parts) {
+            // Find the text/plain part
+            const textPart = payload.parts.find(part => part.mimeType === 'text/plain');
+            if (textPart?.body?.data) {
+                body = Buffer.from(textPart.body.data, 'base64').toString('utf8');
+            }
+        }
+
+        // Create markdown content
+        const markdown = `---
+Subject: ${subject}
+To: ${to}
+Date: ${date}
+---
+
+${body}`;
+
+        // Create safe filename from subject and date
+        const timestamp = new Date(date).getTime();
+        const safeSubject = subject
+            .replace(/[^a-zA-Z0-9]/g, '-')
+            .replace(/-+/g, '-')
+            .substring(0, 50);
+        const filename = `${timestamp}-${safeSubject}.md`;
+        const filepath = path.join(targetDir, filename);
+
+        // Save to file
+        fs.writeFileSync(filepath, markdown, 'utf8');
+        savedEmails.push(filename);
+    }
+
+    return {
+        savedEmails,
+        outputDir: targetDir,
+        message: `Successfully saved ${savedEmails.length} emails to ${targetDir}`
+    };
+}
+
 // Main function
 async function main() {
     await loadCredentials();
@@ -227,6 +323,11 @@ async function main() {
                 name: "delete_email",
                 description: "Permanently deletes an email",
                 inputSchema: zodToJsonSchema(DeleteEmailSchema),
+            },
+            {
+                name: "save_sent_emails",
+                description: "Saves sent emails as markdown files",
+                inputSchema: zodToJsonSchema(SaveSentEmailsSchema),
             },
         ],
     }));
@@ -377,6 +478,24 @@ async function main() {
                             {
                                 type: "text",
                                 text: `Email ${validatedArgs.messageId} deleted successfully`,
+                            },
+                        ],
+                    };
+                }
+
+                case "save_sent_emails": {
+                    const validatedArgs = SaveSentEmailsSchema.parse(args);
+                    const result = await saveSentEmails(
+                        oauth2Client,
+                        validatedArgs.maxResults,
+                        validatedArgs.outputDir
+                    );
+
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: result.message + (result.savedEmails.length > 0 ? ':\n' + result.savedEmails.join('\n') : ''),
                             },
                         ],
                     };

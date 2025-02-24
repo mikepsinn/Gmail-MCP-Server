@@ -24,8 +24,12 @@ const CONFIG_DIR = path.join(os.homedir(), '.gmail-mcp');
 const OAUTH_PATH = process.env.GMAIL_OAUTH_PATH || path.join(CONFIG_DIR, 'gcp-oauth.keys.json');
 const CREDENTIALS_PATH = process.env.GMAIL_CREDENTIALS_PATH || path.join(CONFIG_DIR, 'credentials.json');
 
+// Signature configuration
+const SIGNATURE_TEMPLATE = process.env.GMAIL_SIGNATURE_TEMPLATE || '\n\nBest regards,\n{name}';  // Set to empty string to disable
+
 // OAuth2 configuration
 let oauth2Client: OAuth2Client;
+let userProfile: { name: string; email: string; } | null = null;
 
 async function loadCredentials() {
     try {
@@ -73,6 +77,30 @@ async function loadCredentials() {
     }
 }
 
+async function getUserProfile() {
+    try {
+        const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+        const response = await gmail.users.getProfile({
+            userId: 'me'
+        });
+        
+        // Get full profile info including name
+        const peopleService = google.people({ version: 'v1', auth: oauth2Client });
+        const profileResponse = await peopleService.people.get({
+            resourceName: 'people/me',
+            personFields: 'names,emailAddresses'
+        });
+
+        const name = profileResponse.data.names?.[0]?.displayName || 'User';
+        const email = response.data.emailAddress || '';
+        
+        return { name, email };
+    } catch (error) {
+        console.error('Error fetching user profile:', error);
+        return null;
+    }
+}
+
 async function authenticate() {
     const server = http.createServer();
     server.listen(3000);
@@ -80,7 +108,12 @@ async function authenticate() {
     return new Promise<void>((resolve, reject) => {
         const authUrl = oauth2Client.generateAuthUrl({
             access_type: 'offline',
-            scope: ['https://www.googleapis.com/auth/gmail.modify'],
+            scope: [
+                'https://www.googleapis.com/auth/gmail.modify',
+                'https://www.googleapis.com/auth/gmail.readonly',
+                'https://www.googleapis.com/auth/gmail.metadata',
+                'https://www.googleapis.com/auth/userinfo.profile'
+            ],
         });
 
         console.log('Please visit this URL to authenticate:', authUrl);
@@ -121,7 +154,7 @@ async function authenticate() {
 const SendEmailSchema = z.object({
     to: z.array(z.string()).describe("List of recipient email addresses"),
     subject: z.string().describe("Email subject"),
-    body: z.string().describe("Email body content"),
+    body: z.string().describe("Email body content - Do not include a signature as it will be automatically appended using the authenticated user's name"),
     cc: z.array(z.string()).optional().describe("List of CC recipients"),
     bcc: z.array(z.string()).optional().describe("List of BCC recipients"),
 });
@@ -154,8 +187,9 @@ async function main() {
         process.exit(0);
     }
 
-    // Initialize Gmail API
+    // Initialize Gmail API and get user profile
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    userProfile = await getUserProfile();
 
     // Server implementation
     const server = new Server({
@@ -204,6 +238,16 @@ async function main() {
             switch (name) {
                 case "send_email": {
                     const validatedArgs = SendEmailSchema.parse(args);
+                    // Remove any potential "[Your name]" placeholder if it exists
+                    const cleanBody = validatedArgs.body.replace(/Best regards,\s*\[Your name\]\s*$/, '').trim();
+                    
+                    // Generate signature if template is not empty and we have user profile
+                    let signature = '';
+                    if (SIGNATURE_TEMPLATE && userProfile) {
+                        signature = SIGNATURE_TEMPLATE.replace('{name}', userProfile.name)
+                                                   .replace('{email}', userProfile.email);
+                    }
+
                     const message = [
                         'From: me',
                         `To: ${validatedArgs.to.join(', ')}`,
@@ -211,7 +255,7 @@ async function main() {
                         validatedArgs.bcc ? `Bcc: ${validatedArgs.bcc.join(', ')}` : '',
                         `Subject: ${validatedArgs.subject}`,
                         '',
-                        validatedArgs.body
+                        cleanBody + signature
                     ].filter(Boolean).join('\r\n');
 
                     const encodedMessage = Buffer.from(message).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');

@@ -120,4 +120,102 @@ describe('Gmail Content Tests', () => {
             console.log('---');
         }
     }, 30000); // Increased timeout for API calls
+
+    test('should retrieve and save sent emails as markdown', async () => {
+        const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+        const outputDir = path.join(process.cwd(), 'sent-emails');
+        
+        // Create output directory if it doesn't exist
+        if (!fs.existsSync(outputDir)) {
+            fs.mkdirSync(outputDir, { recursive: true });
+        }
+
+        // Get list of sent messages
+        const listResponse = await gmail.users.messages.list({
+            userId: 'me',
+            maxResults: 50, // Adjust this number as needed
+            q: 'in:sent'
+        });
+
+        expect(listResponse.data.messages).toBeDefined();
+        expect(Array.isArray(listResponse.data.messages)).toBe(true);
+        
+        if (!listResponse.data.messages || listResponse.data.messages.length === 0) {
+            console.log('No sent messages found');
+            return;
+        }
+
+        // Process each message
+        for (const message of listResponse.data.messages) {
+            const messageResponse = await gmail.users.messages.get({
+                userId: 'me',
+                id: message.id!,
+                format: 'full'
+            });
+
+            const headers = messageResponse.data.payload?.headers || [];
+            const subject = headers.find(h => h.name?.toLowerCase() === 'subject')?.value || 'No Subject';
+            const to = headers.find(h => h.name?.toLowerCase() === 'to')?.value || 'No Recipient';
+            const date = headers.find(h => h.name?.toLowerCase() === 'date')?.value || new Date().toISOString();
+
+            // Extract body content
+            let body = '';
+            const payload = messageResponse.data.payload!;
+
+            const getBodyFromParts = (part: any): string => {
+                if (part.mimeType === 'text/plain' && part.body?.data) {
+                    return Buffer.from(part.body.data, 'base64').toString('utf8');
+                }
+                
+                if (part.parts) {
+                    return part.parts
+                        .filter((p: any) => p.mimeType === 'text/plain')
+                        .map((p: any) => getBodyFromParts(p))
+                        .join('\n');
+                }
+                
+                return '';
+            };
+
+            // Get plain text content
+            if (payload.mimeType === 'text/plain' && payload.body?.data) {
+                body = Buffer.from(payload.body.data, 'base64').toString('utf8');
+            } else if (payload.parts) {
+                body = getBodyFromParts(payload);
+            }
+
+            // Create markdown content
+            const markdown = `---
+Subject: ${subject}
+To: ${to}
+Date: ${date}
+---
+
+${body}`;
+
+            // Create safe filename from subject and date
+            const timestamp = new Date(date).getTime();
+            const safeSubject = subject
+                .replace(/[^a-zA-Z0-9]/g, '-')
+                .replace(/-+/g, '-')
+                .substring(0, 50);
+            const filename = `${timestamp}-${safeSubject}.md`;
+            const filepath = path.join(outputDir, filename);
+
+            // Save to file
+            fs.writeFileSync(filepath, markdown, 'utf8');
+            console.log(`Saved email: ${filename}`);
+
+            // Basic content checks
+            expect(fs.existsSync(filepath)).toBe(true);
+            const savedContent = fs.readFileSync(filepath, 'utf8');
+            expect(savedContent).toContain(subject);
+            expect(savedContent).toContain(body);
+        }
+
+        // Check that files were created
+        const savedFiles = fs.readdirSync(outputDir);
+        expect(savedFiles.length).toBeGreaterThan(0);
+        console.log(`Total emails saved: ${savedFiles.length}`);
+    }, 60000); // Increased timeout for processing multiple emails
 }); 
